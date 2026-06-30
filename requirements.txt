@@ -1,0 +1,6 @@
+streamlit
+pandas
+pyiceberg
+boto3
+pyarrow
+s3fs
