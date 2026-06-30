@@ -40,6 +40,7 @@ class CatalogSettings:
                 "type": _env("OPS_UI_ICEBERG_CATALOG_TYPE", "glue"),
                 "warehouse": self.warehouse,
                 "s3.region": AWS_REGION,
+                "glue.region": AWS_REGION,
             },
         )
 
