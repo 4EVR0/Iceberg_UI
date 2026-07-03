@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from hashlib import sha1
+from typing import Any, Optional
 
 import pandas as pd
 import streamlit as st
 
 try:
+    from ops_ui.athena_query import execute_athena_query, validate_athena_settings
+    from ops_ui.drilldown import (
+        DRILLDOWN_SPECS,
+        DrilldownRequest,
+        metric_options,
+        parse_drilldown_request,
+        resolve_drilldown_request,
+    )
     from ops_ui.iceberg_inspector import (
         SnapshotInfo,
         TableSummary,
@@ -17,6 +26,8 @@ try:
     )
     from ops_ui.s3_inspector import latest_object
 except ModuleNotFoundError:
+    from athena_query import execute_athena_query, validate_athena_settings
+    from drilldown import DRILLDOWN_SPECS, DrilldownRequest, metric_options, parse_drilldown_request, resolve_drilldown_request
     from iceberg_inspector import (
         SnapshotInfo,
         TableSummary,
@@ -29,6 +40,12 @@ except ModuleNotFoundError:
 
 
 st.set_page_config(page_title="Iceberg 운영 현황", layout="wide")
+
+
+PROFILE_TABLES = {
+    "oliveyoung_db.oliveyoung_silver_current",
+    "oliveyoung_db.oliveyoung_silver_error",
+}
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -87,9 +104,8 @@ def summary_frame(rows: list[TableSummary]) -> pd.DataFrame:
 
 def render_summary_table(catalog_label: str, rows: list[TableSummary]) -> None:
     st.subheader(catalog_label)
-    frame = summary_frame(rows)
     st.dataframe(
-        frame,
+        summary_frame(rows),
         use_container_width=True,
         hide_index=True,
         column_config={
@@ -98,12 +114,6 @@ def render_summary_table(catalog_label: str, rows: list[TableSummary]) -> None:
             "status": st.column_config.TextColumn(width="medium"),
         },
     )
-
-
-PROFILE_TABLES = {
-    "oliveyoung_db.oliveyoung_silver_current",
-    "oliveyoung_db.oliveyoung_silver_error",
-}
 
 
 def snapshot_options(snapshots: list[SnapshotInfo]) -> list[tuple[str, Optional[int]]]:
@@ -240,42 +250,182 @@ def render_detail(catalog_label: str, identifier: str) -> None:
         )
 
 
-st.title("테이블 운영 현황")
+def query_params_dict() -> dict[str, Any]:
+    return dict(st.query_params)
 
-with st.sidebar:
-    st.header("조회")
-    if st.button("새로고침", use_container_width=True):
-        cached_summaries.clear()
-        st.rerun()
-    st.caption("AWS 인증은 boto3/PyIceberg 기본 자격증명 체인을 사용합니다.")
 
-summaries = cached_summaries()
+def set_query_params(**params: str) -> None:
+    st.query_params.clear()
+    for key, value in params.items():
+        if value:
+            st.query_params[key] = value
 
-loaded_rows = [row for rows in summaries.values() for row in rows if not row.load_error]
-loaded = len(loaded_rows)
-failed = sum(1 for rows in summaries.values() for row in rows if row.load_error)
-total_data_size = sum(row.total_data_size_bytes or 0 for row in loaded_rows)
-load_times = [row.load_elapsed_ms for row in loaded_rows if row.load_elapsed_ms is not None]
-avg_load_time = sum(load_times) / len(load_times) if load_times else None
-metric_left, metric_size, metric_time, metric_right = st.columns(4)
-metric_left.metric("로드된 테이블", loaded)
-metric_size.metric("전체 데이터 크기", format_bytes(total_data_size) if total_data_size else "N/A")
-metric_time.metric("평균 로드 시간", format_elapsed_ms(avg_load_time))
-metric_right.metric("오류", failed)
 
-tabs = st.tabs(list(summaries.keys()))
-for tab, (catalog_label, rows) in zip(tabs, summaries.items()):
-    with tab:
-        render_summary_table(catalog_label, rows)
+def request_signature(request: DrilldownRequest) -> str:
+    raw = "|".join(
+        [
+            request.catalog,
+            request.table,
+            request.metric,
+            request.snapshot_mode,
+            request.batch_date,
+            request.batch_job,
+            request.error_type,
+            request.main_category,
+            request.sub_category,
+            request.from_ts,
+            request.to_ts,
+            str(request.limit),
+        ]
+    )
+    return sha1(raw.encode("utf-8")).hexdigest()[:12]
 
-        selectable = [row for row in rows if not row.load_error]
-        if selectable:
-            selected = st.selectbox(
-                "상세 테이블",
-                options=[row.identifier for row in selectable],
-                key=f"detail-select:{catalog_label}",
+
+def render_drilldown_sidebar() -> None:
+    st.sidebar.markdown("### Drilldown 링크 예시")
+    for metric_key, label in metric_options():
+        if st.sidebar.button(label, key=f"drilldown-nav:{metric_key}", use_container_width=True):
+            spec = DRILLDOWN_SPECS[metric_key]
+            set_query_params(
+                view="drilldown",
+                metric=metric_key,
+                catalog=spec.default_catalog,
+                table=spec.default_table,
+                snapshot_mode="latest",
             )
-            render_detail(catalog_label, selected)
-        else:
-            for row in rows:
-                st.error(row.load_error)
+            st.rerun()
+
+
+def render_drilldown_view() -> None:
+    st.title("Grafana Drilldown")
+    render_drilldown_sidebar()
+
+    missing_vars = validate_athena_settings()
+    if missing_vars:
+        st.error(f"Athena 설정이 부족합니다: {', '.join(missing_vars)}")
+        return
+
+    params = query_params_dict()
+    try:
+        request = parse_drilldown_request(params)
+    except Exception as exc:
+        st.error(f"Drilldown 파라미터 오류: {exc}")
+        render_drilldown_help()
+        return
+
+    if request is None:
+        render_drilldown_help()
+        return
+
+    try:
+        resolved = resolve_drilldown_request(request)
+    except Exception as exc:
+        st.error(f"Drilldown 컨텍스트 조회 실패: {exc}")
+        return
+
+    st.caption(resolved.spec.description)
+    st.dataframe(pd.DataFrame(resolved.context_rows), use_container_width=True, hide_index=True)
+
+    sql_key = f"drilldown-sql:{request_signature(request)}"
+    auto_key = f"drilldown-auto:{request_signature(request)}"
+    if sql_key not in st.session_state:
+        st.session_state[sql_key] = resolved.generated_sql
+        st.session_state[auto_key] = True
+
+    st.markdown("#### SQL")
+    st.text_area("Athena SQL", key=sql_key, height=260)
+    run_clicked = st.button("쿼리 실행", type="primary", use_container_width=True)
+    auto_run = st.session_state.get(auto_key, False)
+
+    if run_clicked or auto_run:
+        st.session_state[auto_key] = False
+        with st.spinner("Athena 쿼리를 실행하는 중입니다."):
+            try:
+                result = execute_athena_query(st.session_state[sql_key], max_rows=request.limit)
+            except Exception as exc:
+                st.error(f"Athena 실행 실패: {exc}")
+                return
+
+        left, middle, right = st.columns(3)
+        left.metric("Rows", f"{result.row_count:,}")
+        middle.metric("실행 시간", format_elapsed_ms(float(result.execution_time_ms)))
+        right.metric("Query ID", result.query_execution_id)
+        st.dataframe(pd.DataFrame(result.rows), use_container_width=True, hide_index=True)
+
+    with st.expander("현재 테이블 상세 보기"):
+        render_detail(request.catalog, request.identifier)
+
+
+def render_drilldown_help() -> None:
+    st.info("`view=drilldown` 과 `metric` 파라미터로 진입하면 Grafana 연동 쿼리를 자동 실행합니다.")
+    examples = pd.DataFrame(
+        [
+            {
+                "metric": "category_failure",
+                "label": DRILLDOWN_SPECS["category_failure"].label,
+                "example": "?view=drilldown&metric=category_failure&catalog=oliveyoung_db&table=oliveyoung_silver_error&main_category=스킨케어&sub_category=토너&snapshot_mode=latest",
+            },
+            {
+                "metric": "error_type_spike",
+                "label": DRILLDOWN_SPECS["error_type_spike"].label,
+                "example": "?view=drilldown&metric=error_type_spike&catalog=oliveyoung_db&table=oliveyoung_silver_error&error_type=category_parse_failed&snapshot_mode=latest",
+            },
+            {
+                "metric": "category_success_count",
+                "label": DRILLDOWN_SPECS["category_success_count"].label,
+                "example": "?view=drilldown&metric=category_success_count&catalog=oliveyoung_db&table=oliveyoung_silver_current&main_category=메이크업&snapshot_mode=latest",
+            },
+        ]
+    )
+    st.dataframe(examples, use_container_width=True, hide_index=True)
+
+
+def render_overview_view() -> None:
+    st.title("테이블 운영 현황")
+
+    with st.sidebar:
+        st.header("조회")
+        if st.button("새로고침", use_container_width=True):
+            cached_summaries.clear()
+            st.rerun()
+        if st.button("Drilldown 화면 열기", use_container_width=True):
+            set_query_params(view="drilldown")
+            st.rerun()
+        st.caption("AWS 인증은 boto3/PyIceberg 기본 자격증명 체인을 사용합니다.")
+
+    summaries = cached_summaries()
+    loaded_rows = [row for rows in summaries.values() for row in rows if not row.load_error]
+    loaded = len(loaded_rows)
+    failed = sum(1 for rows in summaries.values() for row in rows if row.load_error)
+    total_data_size = sum(row.total_data_size_bytes or 0 for row in loaded_rows)
+    load_times = [row.load_elapsed_ms for row in loaded_rows if row.load_elapsed_ms is not None]
+    avg_load_time = sum(load_times) / len(load_times) if load_times else None
+
+    metric_left, metric_size, metric_time, metric_right = st.columns(4)
+    metric_left.metric("로드된 테이블", loaded)
+    metric_size.metric("전체 데이터 크기", format_bytes(total_data_size) if total_data_size else "N/A")
+    metric_time.metric("평균 로드 시간", format_elapsed_ms(avg_load_time))
+    metric_right.metric("오류", failed)
+
+    tabs = st.tabs(list(summaries.keys()))
+    for tab, (catalog_label, rows) in zip(tabs, summaries.items()):
+        with tab:
+            render_summary_table(catalog_label, rows)
+
+            selectable = [row for row in rows if not row.load_error]
+            if selectable:
+                selected = st.selectbox(
+                    "상세 테이블",
+                    options=[row.identifier for row in selectable],
+                    key=f"detail-select:{catalog_label}",
+                )
+                render_detail(catalog_label, selected)
+            else:
+                for row in rows:
+                    st.error(row.load_error)
+
+
+if query_params_dict().get("view") == "drilldown":
+    render_drilldown_view()
+else:
+    render_overview_view()

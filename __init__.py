@@ -1,1 +1,1 @@
-"""Read-only operational UI helpers for Olive Young Iceberg tables."""
+"""Operational UI helpers for Olive Young Iceberg tables and drilldowns."""
