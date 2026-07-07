@@ -275,7 +275,6 @@ def request_signature(request: DrilldownRequest) -> str:
             request.sub_category,
             request.from_ts,
             request.to_ts,
-            str(request.limit),
         ]
     )
     return sha1(raw.encode("utf-8")).hexdigest()[:12]
@@ -341,7 +340,7 @@ def render_drilldown_view() -> None:
         st.session_state[auto_key] = False
         with st.spinner("Athena 쿼리를 실행하는 중입니다."):
             try:
-                result = execute_athena_query(st.session_state[sql_key], max_rows=request.limit)
+                result = execute_athena_query(st.session_state[sql_key])
             except Exception as exc:
                 st.error(f"Athena 실행 실패: {exc}")
                 return

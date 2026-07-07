@@ -19,6 +19,7 @@ load_dotenv()
 DEFAULT_REGION = "ap-northeast-2"
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_TIMEOUT_SECONDS = 45.0
+ATHENA_PAGE_SIZE = 1000
 
 
 def _env(name: str, default: str = "") -> str:
@@ -71,7 +72,6 @@ def validate_athena_settings() -> list[str]:
 def execute_athena_query(
     query: str,
     *,
-    max_rows: int = 200,
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> AthenaQueryResult:
@@ -87,19 +87,48 @@ def execute_athena_query(
     )
     execution_id = response["QueryExecutionId"]
     execution = _wait_for_query(client, execution_id, poll_interval_seconds, timeout_seconds)
-    result_set = client.get_query_results(QueryExecutionId=execution_id, MaxResults=max_rows + 1)
-
-    columns = [column.get("Name", "") for column in result_set["ResultSet"]["ResultSetMetadata"]["ColumnInfo"]]
-    rows = _rows_from_result_set(result_set.get("ResultSet", {}).get("Rows", []), columns)
+    columns, rows = _fetch_all_rows(client, execution_id)
     execution_time_ms = execution.get("Statistics", {}).get("EngineExecutionTimeInMillis", 0)
     return AthenaQueryResult(
         query=query,
         query_execution_id=execution_id,
         columns=columns,
-        rows=rows[:max_rows],
+        rows=rows,
         row_count=len(rows),
         execution_time_ms=execution_time_ms,
     )
+
+
+def _fetch_all_rows(client: Any, execution_id: str) -> tuple[list[str], list[dict[str, Any]]]:
+    rows: list[dict[str, Any]] = []
+    next_token: str | None = None
+    columns: list[str] | None = None
+
+    while True:
+        request: dict[str, Any] = {
+            "QueryExecutionId": execution_id,
+            "MaxResults": ATHENA_PAGE_SIZE,
+        }
+        if next_token:
+            request["NextToken"] = next_token
+
+        result_set = client.get_query_results(**request)
+        if columns is None:
+            columns = [
+                column.get("Name", "")
+                for column in result_set["ResultSet"]["ResultSetMetadata"]["ColumnInfo"]
+            ]
+
+        rows.extend(
+            _rows_from_result_set(
+                result_set.get("ResultSet", {}).get("Rows", []),
+                columns,
+                skip_header=next_token is None,
+            )
+        )
+        next_token = result_set.get("NextToken")
+        if not next_token:
+            return columns, rows
 
 
 def _wait_for_query(
@@ -124,11 +153,16 @@ def _wait_for_query(
         time.sleep(poll_interval_seconds)
 
 
-def _rows_from_result_set(result_rows: list[dict[str, Any]], columns: list[str]) -> list[dict[str, Any]]:
+def _rows_from_result_set(
+    result_rows: list[dict[str, Any]],
+    columns: list[str],
+    *,
+    skip_header: bool,
+) -> list[dict[str, Any]]:
     if not result_rows:
         return []
 
-    data_rows = result_rows[1:] if columns else result_rows
+    data_rows = result_rows[1:] if skip_header else result_rows
     parsed_rows: list[dict[str, Any]] = []
     for row in data_rows:
         values = row.get("Data", [])

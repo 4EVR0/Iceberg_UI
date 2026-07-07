@@ -10,11 +10,6 @@ except ModuleNotFoundError:
     from iceberg_inspector import TableDetail, load_table_detail
     from settings import catalog_configs as configured_catalogs
 
-
-DEFAULT_ROW_LIMIT = 200
-MAX_ROW_LIMIT = 1000
-
-
 @dataclass(frozen=True)
 class DrilldownRequest:
     catalog: str
@@ -28,7 +23,6 @@ class DrilldownRequest:
     sub_category: str = ""
     from_ts: str = ""
     to_ts: str = ""
-    limit: int = DEFAULT_ROW_LIMIT
 
     @property
     def identifier(self) -> str:
@@ -180,7 +174,6 @@ def parse_drilldown_request(params: Mapping[str, Any]) -> Optional[DrilldownRequ
         sub_category=_param(params, "sub_category"),
         from_ts=_param(params, "from"),
         to_ts=_param(params, "to"),
-        limit=_int_param(params, "limit", DEFAULT_ROW_LIMIT),
     )
     validate_request(request)
     return request
@@ -262,7 +255,6 @@ def build_drilldown_sql(
     if request.to_ts:
         filters.append(f"crawled_at <= from_iso8601_timestamp({_quote(request.to_ts)})")
 
-    limit = min(max(request.limit, 1), MAX_ROW_LIMIT)
     select_clause = ",\n    ".join(spec.result_columns)
     where_clause = "\n  AND ".join(filters)
     order_clause = ", ".join(spec.order_by)
@@ -274,8 +266,7 @@ def build_drilldown_sql(
         f"    {select_clause}\n"
         f"FROM {request.identifier}\n"
         f"WHERE {where_clause}\n"
-        f"ORDER BY {order_clause}\n"
-        f"LIMIT {limit}"
+        f"ORDER BY {order_clause}"
     )
 
 
