@@ -7,6 +7,14 @@ from typing import Any
 
 import boto3
 
+try:
+    from ops_ui.env_loader import load_dotenv
+except ModuleNotFoundError:
+    from env_loader import load_dotenv
+
+
+load_dotenv()
+
 
 DEFAULT_REGION = "ap-northeast-2"
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0

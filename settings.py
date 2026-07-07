@@ -6,6 +6,14 @@ from typing import Any, Callable
 
 from pyiceberg.catalog import load_catalog
 
+try:
+    from ops_ui.env_loader import load_dotenv
+except ModuleNotFoundError:
+    from env_loader import load_dotenv
+
+
+load_dotenv()
+
 
 DEFAULT_BUCKET = "oliveyoung-crawl-data"
 DEFAULT_REGION = "ap-northeast-2"
