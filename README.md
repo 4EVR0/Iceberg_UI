@@ -37,4 +37,10 @@ Defaults match the current production paths.
 /?view=drilldown&metric=category_failure&catalog=oliveyoung_db&table=oliveyoung_silver_error&main_category=스킨케어&sub_category=토너&snapshot_mode=latest
 
 /?view=drilldown&metric=error_type_spike&catalog=oliveyoung_db&table=oliveyoung_silver_error&error_type=category_parse_failed&snapshot_mode=latest
+
+/?view=drilldown&metric=category_success_count&catalog=oliveyoung_db&table=oliveyoung_silver_current&snapshot_mode=latest&batch_date=2026-07-11&main_category=메이크업
 ```
+
+If `batch_date` is provided without any `previous_*` parameters, the drilldown
+automatically compares the latest snapshot with the last `DELETE` snapshot
+committed on that UTC date.

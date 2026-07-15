@@ -12,6 +12,7 @@ try:
     from ops_ui.drilldown import (
         DRILLDOWN_SPECS,
         DrilldownRequest,
+        allowed_identifiers,
         metric_options,
         parse_drilldown_request,
         resolve_drilldown_request,
@@ -27,7 +28,14 @@ try:
     from ops_ui.s3_inspector import latest_object
 except ModuleNotFoundError:
     from athena_query import execute_athena_query, validate_athena_settings
-    from drilldown import DRILLDOWN_SPECS, DrilldownRequest, metric_options, parse_drilldown_request, resolve_drilldown_request
+    from drilldown import (
+        DRILLDOWN_SPECS,
+        DrilldownRequest,
+        allowed_identifiers,
+        metric_options,
+        parse_drilldown_request,
+        resolve_drilldown_request,
+    )
     from iceberg_inspector import (
         SnapshotInfo,
         TableSummary,
@@ -268,7 +276,12 @@ def request_signature(request: DrilldownRequest) -> str:
             request.table,
             request.metric,
             request.snapshot_mode,
+            request.as_of,
+            request.snapshot_id,
             request.batch_date,
+            request.previous_as_of,
+            request.previous_snapshot_id,
+            request.previous_batch_date,
             request.batch_job,
             request.error_type,
             request.main_category,
@@ -278,6 +291,214 @@ def request_signature(request: DrilldownRequest) -> str:
         ]
     )
     return sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def _drilldown_snapshot_options(snapshots: list[SnapshotInfo]) -> list[tuple[str, str]]:
+    options: list[tuple[str, str]] = []
+    for snapshot in snapshots:
+        if snapshot.snapshot_id is None:
+            continue
+        label = f"{snapshot.snapshot_id} | {format_dt(snapshot.committed_at)} | {snapshot.operation}"
+        options.append((label, str(snapshot.snapshot_id)))
+    return options
+
+
+def _index_or_zero(options: list[str], value: str) -> int:
+    try:
+        return options.index(value)
+    except ValueError:
+        return 0
+
+
+def _metric_filter_defaults(metric: str, params: dict[str, Any]) -> dict[str, str]:
+    spec = DRILLDOWN_SPECS[metric]
+    defaults = {
+        "batch_job": str(params.get("batch_job", "")).strip(),
+        "error_type": str(params.get("error_type", "")).strip(),
+        "main_category": str(params.get("main_category", "")).strip(),
+        "sub_category": str(params.get("sub_category", "")).strip(),
+        "from": str(params.get("from", "")).strip(),
+        "to": str(params.get("to", "")).strip(),
+    }
+    if not defaults["error_type"] and "error_type" in spec.required_filters:
+        defaults["error_type"] = "category_parse_failed"
+    return defaults
+
+
+def render_drilldown_controls(params: dict[str, Any]) -> None:
+    metric_keys = [key for key, _label in metric_options()]
+    selected_metric = str(params.get("metric", "")).strip() or metric_keys[0]
+    if selected_metric not in DRILLDOWN_SPECS:
+        selected_metric = metric_keys[0]
+    spec = DRILLDOWN_SPECS[selected_metric]
+
+    identifier_options = sorted(allowed_identifiers())
+    current_identifier = str(params.get("table", "")).strip()
+    if not current_identifier:
+        current_identifier = f"{spec.default_catalog}.{spec.default_table}"
+    elif "." not in current_identifier:
+        current_identifier = f"{str(params.get('catalog', spec.default_catalog)).strip()}.{current_identifier}"
+    if current_identifier not in identifier_options:
+        identifier_options = [current_identifier, *identifier_options]
+
+    current_catalog, current_table = current_identifier.split(".", 1)
+    try:
+        detail = load_table_detail(current_catalog, current_identifier)
+    except Exception as exc:
+        detail = None
+        st.warning(f"비교 UI용 스냅샷 정보를 불러오지 못했습니다: {exc}")
+
+    snapshot_options = _drilldown_snapshot_options(detail.snapshots if detail else [])
+    snapshot_labels = [label for label, _value in snapshot_options]
+    snapshot_values = dict(snapshot_options)
+    latest_batch_date = ""
+    if detail and detail.summary.latest_batch_date is not None:
+        latest_batch_date = detail.summary.latest_batch_date.strftime("%Y-%m-%d")
+
+    current_snapshot_mode = "latest"
+    if str(params.get("snapshot_mode", "latest")).strip() == "asof":
+        current_snapshot_mode = "snapshot_id" if str(params.get("snapshot_id", "")).strip() else "as_of"
+
+    compare_enabled = any(
+        str(params.get(key, "")).strip()
+        for key in ("previous_as_of", "previous_snapshot_id", "previous_batch_date")
+    )
+    previous_snapshot_mode = "snapshot_id" if str(params.get("previous_snapshot_id", "")).strip() else "as_of"
+    defaults = _metric_filter_defaults(selected_metric, params)
+
+    with st.expander("비교 조건", expanded=True):
+        with st.form("drilldown-controls"):
+            metric = st.selectbox(
+                "Metric",
+                options=metric_keys,
+                index=_index_or_zero(metric_keys, selected_metric),
+                format_func=lambda key: DRILLDOWN_SPECS[key].label,
+            )
+            identifier = st.selectbox(
+                "Table",
+                options=identifier_options,
+                index=_index_or_zero(identifier_options, current_identifier),
+            )
+
+            batch_default = str(params.get("batch_date", "")).strip() or latest_batch_date
+            batch_date = st.text_input("Current batch_date", value=batch_default, placeholder="YYYY-MM-DD")
+
+            current_mode = st.radio(
+                "Current snapshot",
+                options=["latest", "snapshot_id", "as_of"],
+                index=_index_or_zero(["latest", "snapshot_id", "as_of"], current_snapshot_mode),
+                horizontal=True,
+            )
+            selected_snapshot_label = ""
+            if snapshot_labels:
+                requested_snapshot_id = str(params.get("snapshot_id", "")).strip()
+                selected_snapshot_label = next(
+                    (label for label, value in snapshot_options if value == requested_snapshot_id),
+                    snapshot_labels[0],
+                )
+            current_snapshot_label = ""
+            current_as_of = str(params.get("as_of", "")).strip()
+            if current_mode == "snapshot_id":
+                if snapshot_labels:
+                    current_snapshot_label = st.selectbox(
+                        "Current snapshot_id",
+                        options=snapshot_labels,
+                        index=_index_or_zero(snapshot_labels, selected_snapshot_label),
+                    )
+                else:
+                    st.caption("선택 가능한 스냅샷이 없습니다.")
+            elif current_mode == "as_of":
+                current_as_of = st.text_input(
+                    "Current as_of",
+                    value=current_as_of,
+                    placeholder="2026-07-11T00:00:00Z",
+                )
+
+            compare_enabled = st.checkbox("비교 모드", value=compare_enabled)
+            previous_batch_date = ""
+            previous_snapshot_label = ""
+            previous_as_of = str(params.get("previous_as_of", "")).strip()
+            if compare_enabled:
+                previous_batch_default = str(params.get("previous_batch_date", "")).strip() or batch_date
+                previous_batch_date = st.text_input(
+                    "Previous batch_date",
+                    value=previous_batch_default,
+                    placeholder="YYYY-MM-DD",
+                )
+                previous_mode = st.radio(
+                    "Previous snapshot",
+                    options=["snapshot_id", "as_of"],
+                    index=_index_or_zero(["snapshot_id", "as_of"], previous_snapshot_mode),
+                    horizontal=True,
+                )
+                requested_previous_snapshot_id = str(params.get("previous_snapshot_id", "")).strip()
+                previous_selected_label = next(
+                    (label for label, value in snapshot_options if value == requested_previous_snapshot_id),
+                    snapshot_labels[0] if snapshot_labels else "",
+                )
+                if previous_mode == "snapshot_id":
+                    if snapshot_labels:
+                        previous_snapshot_label = st.selectbox(
+                            "Previous snapshot_id",
+                            options=snapshot_labels,
+                            index=_index_or_zero(snapshot_labels, previous_selected_label),
+                        )
+                    else:
+                        st.caption("선택 가능한 이전 스냅샷이 없습니다.")
+                else:
+                    previous_as_of = st.text_input(
+                        "Previous as_of",
+                        value=previous_as_of,
+                        placeholder="2026-07-10T00:00:00Z",
+                    )
+
+            filter_left, filter_right = st.columns(2)
+            with filter_left:
+                main_category = st.text_input("main_category", value=defaults["main_category"])
+                batch_job = st.text_input("batch_job", value=defaults["batch_job"])
+                from_ts = st.text_input("from", value=defaults["from"], placeholder="ISO8601")
+            with filter_right:
+                sub_category = st.text_input("sub_category", value=defaults["sub_category"])
+                error_type = st.text_input("error_type", value=defaults["error_type"])
+                to_ts = st.text_input("to", value=defaults["to"], placeholder="ISO8601")
+
+            submitted = st.form_submit_button("조건 적용", use_container_width=True)
+
+        if submitted:
+            next_spec = DRILLDOWN_SPECS[metric]
+            selected_identifier = identifier if "." in identifier else f"{next_spec.default_catalog}.{identifier}"
+            catalog, table = selected_identifier.split(".", 1)
+            next_params: dict[str, str] = {
+                "view": "drilldown",
+                "metric": metric,
+                "catalog": catalog,
+                "table": table,
+                "batch_date": batch_date.strip(),
+                "batch_job": batch_job.strip(),
+                "error_type": error_type.strip(),
+                "main_category": main_category.strip(),
+                "sub_category": sub_category.strip(),
+                "from": from_ts.strip(),
+                "to": to_ts.strip(),
+            }
+            if current_mode == "latest":
+                next_params["snapshot_mode"] = "latest"
+            else:
+                next_params["snapshot_mode"] = "asof"
+                if current_mode == "snapshot_id" and current_snapshot_label:
+                    next_params["snapshot_id"] = snapshot_values[current_snapshot_label]
+                if current_mode == "as_of":
+                    next_params["as_of"] = current_as_of.strip()
+
+            if compare_enabled:
+                next_params["previous_batch_date"] = previous_batch_date.strip()
+                if previous_mode == "snapshot_id" and previous_snapshot_label:
+                    next_params["previous_snapshot_id"] = snapshot_values[previous_snapshot_label]
+                if previous_mode == "as_of":
+                    next_params["previous_as_of"] = previous_as_of.strip()
+
+            set_query_params(**next_params)
+            st.rerun()
 
 
 def render_drilldown_sidebar() -> None:
@@ -298,6 +519,9 @@ def render_drilldown_sidebar() -> None:
 def render_drilldown_view() -> None:
     st.title("Grafana Drilldown")
     render_drilldown_sidebar()
+    if st.button("홈 UI로 돌아가기", use_container_width=True):
+        set_query_params()
+        st.rerun()
 
     missing_vars = validate_athena_settings()
     if missing_vars:
@@ -305,6 +529,7 @@ def render_drilldown_view() -> None:
         return
 
     params = query_params_dict()
+    render_drilldown_controls(params)
     try:
         request = parse_drilldown_request(params)
     except Exception as exc:
@@ -325,8 +550,8 @@ def render_drilldown_view() -> None:
     st.caption(resolved.spec.description)
     st.dataframe(pd.DataFrame(resolved.context_rows), use_container_width=True, hide_index=True)
 
-    sql_key = f"drilldown-sql:{request_signature(request)}"
-    auto_key = f"drilldown-auto:{request_signature(request)}"
+    sql_key = f"drilldown-sql:{request_signature(resolved.request)}"
+    auto_key = f"drilldown-auto:{request_signature(resolved.request)}"
     if sql_key not in st.session_state:
         st.session_state[sql_key] = resolved.generated_sql
         st.session_state[auto_key] = True
@@ -342,7 +567,7 @@ def render_drilldown_view() -> None:
             try:
                 result = execute_athena_query(st.session_state[sql_key])
             except Exception as exc:
-                st.error(f"Athena 실행 실패: {exc}")
+                st.error(normalize_athena_error(exc, resolved.request))
                 return
 
         left, middle, right = st.columns(3)
@@ -372,11 +597,29 @@ def render_drilldown_help() -> None:
             {
                 "metric": "category_success_count",
                 "label": DRILLDOWN_SPECS["category_success_count"].label,
-                "example": "?view=drilldown&metric=category_success_count&catalog=oliveyoung_db&table=oliveyoung_silver_current&main_category=메이크업&snapshot_mode=latest",
+                "example": "?view=drilldown&metric=category_success_count&catalog=oliveyoung_db&table=oliveyoung_silver_current&snapshot_mode=latest&batch_date=2026-07-11&main_category=메이크업",
             },
         ]
     )
     st.dataframe(examples, use_container_width=True, hide_index=True)
+
+
+def normalize_athena_error(exc: Exception, request: DrilldownRequest) -> str:
+    message = str(exc)
+    if request.snapshot_mode == "asof":
+        lowered = message.lower()
+        if (
+            "expire" in lowered
+            or "expired" in lowered
+            or "snapshot" in lowered
+            or "version as of" in lowered
+            or "timestamp as of" in lowered
+        ):
+            return (
+                "만료되었거나 존재하지 않는 스냅샷 시점입니다. "
+                f"as_of={request.as_of or 'N/A'}, snapshot_id={request.snapshot_id or 'N/A'}"
+            )
+    return f"Athena 실행 실패: {message}"
 
 
 def render_overview_view() -> None:
