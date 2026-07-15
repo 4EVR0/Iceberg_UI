@@ -303,6 +303,10 @@ def _drilldown_snapshot_options(snapshots: list[SnapshotInfo]) -> list[tuple[str
     return options
 
 
+def _current_drilldown_snapshot_options(snapshots: list[SnapshotInfo]) -> list[tuple[str, str]]:
+    return [("현재 스냅샷", "__latest__"), *_drilldown_snapshot_options(snapshots)]
+
+
 def _index_or_zero(options: list[str], value: str) -> int:
     try:
         return options.index(value)
@@ -348,22 +352,20 @@ def render_drilldown_controls(params: dict[str, Any]) -> None:
         detail = None
         st.warning(f"비교 UI용 스냅샷 정보를 불러오지 못했습니다: {exc}")
 
-    snapshot_options = _drilldown_snapshot_options(detail.snapshots if detail else [])
-    snapshot_labels = [label for label, _value in snapshot_options]
-    snapshot_values = dict(snapshot_options)
+    current_snapshot_options = _current_drilldown_snapshot_options(detail.snapshots if detail else [])
+    current_snapshot_labels = [label for label, _value in current_snapshot_options]
+    current_snapshot_values = dict(current_snapshot_options)
+    compare_snapshot_options = _drilldown_snapshot_options(detail.snapshots if detail else [])
+    compare_snapshot_labels = [label for label, _value in compare_snapshot_options]
+    compare_snapshot_values = dict(compare_snapshot_options)
     latest_batch_date = ""
     if detail and detail.summary.latest_batch_date is not None:
         latest_batch_date = detail.summary.latest_batch_date.strftime("%Y-%m-%d")
-
-    current_snapshot_mode = "latest"
-    if str(params.get("snapshot_mode", "latest")).strip() == "asof":
-        current_snapshot_mode = "snapshot_id" if str(params.get("snapshot_id", "")).strip() else "as_of"
 
     compare_enabled = any(
         str(params.get(key, "")).strip()
         for key in ("previous_as_of", "previous_snapshot_id", "previous_batch_date")
     )
-    previous_snapshot_mode = "snapshot_id" if str(params.get("previous_snapshot_id", "")).strip() else "as_of"
     defaults = _metric_filter_defaults(selected_metric, params)
 
     with st.expander("비교 조건", expanded=True):
@@ -383,41 +385,22 @@ def render_drilldown_controls(params: dict[str, Any]) -> None:
             batch_default = str(params.get("batch_date", "")).strip() or latest_batch_date
             batch_date = st.text_input("Current batch_date", value=batch_default, placeholder="YYYY-MM-DD")
 
-            current_mode = st.radio(
+            requested_snapshot_id = str(params.get("snapshot_id", "")).strip()
+            current_snapshot_default = "현재 스냅샷"
+            if str(params.get("snapshot_mode", "latest")).strip() == "asof" and requested_snapshot_id:
+                current_snapshot_default = next(
+                    (label for label, value in current_snapshot_options if value == requested_snapshot_id),
+                    current_snapshot_default,
+                )
+            current_snapshot_label = st.selectbox(
                 "Current snapshot",
-                options=["latest", "snapshot_id", "as_of"],
-                index=_index_or_zero(["latest", "snapshot_id", "as_of"], current_snapshot_mode),
-                horizontal=True,
+                options=current_snapshot_labels,
+                index=_index_or_zero(current_snapshot_labels, current_snapshot_default),
             )
-            selected_snapshot_label = ""
-            if snapshot_labels:
-                requested_snapshot_id = str(params.get("snapshot_id", "")).strip()
-                selected_snapshot_label = next(
-                    (label for label, value in snapshot_options if value == requested_snapshot_id),
-                    snapshot_labels[0],
-                )
-            current_snapshot_label = ""
-            current_as_of = str(params.get("as_of", "")).strip()
-            if current_mode == "snapshot_id":
-                if snapshot_labels:
-                    current_snapshot_label = st.selectbox(
-                        "Current snapshot_id",
-                        options=snapshot_labels,
-                        index=_index_or_zero(snapshot_labels, selected_snapshot_label),
-                    )
-                else:
-                    st.caption("선택 가능한 스냅샷이 없습니다.")
-            elif current_mode == "as_of":
-                current_as_of = st.text_input(
-                    "Current as_of",
-                    value=current_as_of,
-                    placeholder="2026-07-11T00:00:00Z",
-                )
 
             compare_enabled = st.checkbox("비교 모드", value=compare_enabled)
             previous_batch_date = ""
             previous_snapshot_label = ""
-            previous_as_of = str(params.get("previous_as_of", "")).strip()
             if compare_enabled:
                 previous_batch_default = str(params.get("previous_batch_date", "")).strip() or batch_date
                 previous_batch_date = st.text_input(
@@ -425,32 +408,19 @@ def render_drilldown_controls(params: dict[str, Any]) -> None:
                     value=previous_batch_default,
                     placeholder="YYYY-MM-DD",
                 )
-                previous_mode = st.radio(
-                    "Previous snapshot",
-                    options=["snapshot_id", "as_of"],
-                    index=_index_or_zero(["snapshot_id", "as_of"], previous_snapshot_mode),
-                    horizontal=True,
-                )
                 requested_previous_snapshot_id = str(params.get("previous_snapshot_id", "")).strip()
                 previous_selected_label = next(
-                    (label for label, value in snapshot_options if value == requested_previous_snapshot_id),
-                    snapshot_labels[0] if snapshot_labels else "",
+                    (label for label, value in compare_snapshot_options if value == requested_previous_snapshot_id),
+                    compare_snapshot_labels[0] if compare_snapshot_labels else "",
                 )
-                if previous_mode == "snapshot_id":
-                    if snapshot_labels:
-                        previous_snapshot_label = st.selectbox(
-                            "Previous snapshot_id",
-                            options=snapshot_labels,
-                            index=_index_or_zero(snapshot_labels, previous_selected_label),
-                        )
-                    else:
-                        st.caption("선택 가능한 이전 스냅샷이 없습니다.")
-                else:
-                    previous_as_of = st.text_input(
-                        "Previous as_of",
-                        value=previous_as_of,
-                        placeholder="2026-07-10T00:00:00Z",
+                if compare_snapshot_labels:
+                    previous_snapshot_label = st.selectbox(
+                        "Previous snapshot",
+                        options=compare_snapshot_labels,
+                        index=_index_or_zero(compare_snapshot_labels, previous_selected_label),
                     )
+                else:
+                    st.caption("선택 가능한 이전 스냅샷이 없습니다.")
 
             filter_left, filter_right = st.columns(2)
             with filter_left:
@@ -481,21 +451,17 @@ def render_drilldown_controls(params: dict[str, Any]) -> None:
                 "from": from_ts.strip(),
                 "to": to_ts.strip(),
             }
-            if current_mode == "latest":
+            selected_current_snapshot = current_snapshot_values.get(current_snapshot_label, "__latest__")
+            if selected_current_snapshot == "__latest__":
                 next_params["snapshot_mode"] = "latest"
             else:
                 next_params["snapshot_mode"] = "asof"
-                if current_mode == "snapshot_id" and current_snapshot_label:
-                    next_params["snapshot_id"] = snapshot_values[current_snapshot_label]
-                if current_mode == "as_of":
-                    next_params["as_of"] = current_as_of.strip()
+                next_params["snapshot_id"] = selected_current_snapshot
 
             if compare_enabled:
                 next_params["previous_batch_date"] = previous_batch_date.strip()
-                if previous_mode == "snapshot_id" and previous_snapshot_label:
-                    next_params["previous_snapshot_id"] = snapshot_values[previous_snapshot_label]
-                if previous_mode == "as_of":
-                    next_params["previous_as_of"] = previous_as_of.strip()
+                if previous_snapshot_label:
+                    next_params["previous_snapshot_id"] = compare_snapshot_values[previous_snapshot_label]
 
             set_query_params(**next_params)
             st.rerun()
