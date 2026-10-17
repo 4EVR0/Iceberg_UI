@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from time import perf_counter
@@ -322,6 +323,12 @@ def _latest_batch_metadata(table: Any) -> tuple[Optional[datetime], str]:
     if pd.isna(batch_job) or not str(batch_job).strip():
         return batch_date, "N/A"
 
+    batch_job = str(batch_job)
+    # 2026-10부터 정상 전처리 행의 batch_job은 실행 ID(bronze_to_silver_YYYYMMDD_HHMMSS) 자체이고,
+    # 백필 행은 고정 키(backfill_<source_run_id>)다. 이미 식별자면 그대로 쓰고,
+    # 작업 이름만 있는 이전 형식일 때만 batch_date를 붙여 추정한다.
+    if re.search(r"_\d{8}_\d{6}$", batch_job) or batch_job.startswith("backfill_"):
+        return batch_date, batch_job
     return batch_date, f"{batch_job}_{batch_date.strftime('%Y%m%d_%H%M%S')}"
 
 
